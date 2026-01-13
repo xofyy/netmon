@@ -1,0 +1,22 @@
+[Unit]
+Description=netmon - Application-based Network Traffic Monitor
+Documentation=https://github.com/user/netmon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/netmon start
+ExecStop=/usr/local/bin/netmon stop
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/netmon /var/log /var/run /etc/netmon
+
+[Install]
+WantedBy=multi-user.target

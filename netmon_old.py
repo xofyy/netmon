@@ -352,13 +352,14 @@ def get_all_interfaces():
     interfaces = []
     
     # Hariç tutulacak interface pattern'leri
-    EXCLUDE_PATTERNS = ('lo', 'veth', 'br-', 'virbr')
+    EXCLUDE_PATTERNS = ('lo', 'veth', 'virbr')
     
     # Dahil edilecek interface pattern'leri
     INCLUDE_PATTERNS = (
         'eth', 'enp', 'ens', 'eno',  # Ethernet
         'wlan', 'wlp',                # WiFi
         'docker0',                    # Docker ana bridge
+        'br-',                        # Docker custom network bridge'leri
         'tailscale',                  # Tailscale VPN
     )
     
@@ -1329,6 +1330,103 @@ def show_unknown_traffic(days=7):
     print()
 
 
+def live_monitor():
+    """
+    Canlı trafik izleme - nethogs çıktısını gerçek zamanlı göster
+    Ctrl+C ile çıkış
+    """
+    global INTERFACES
+    
+    if INTERFACES is None:
+        INTERFACES = get_all_interfaces()
+    
+    excluded = get_excluded_ips()
+    
+    # nethogs başlat
+    cmd = ['nethogs', '-t', '-d', str(NETHOGS_REFRESH_SEC)] + INTERFACES
+    env = {**os.environ, 'LANG': 'C', 'LC_ALL': 'C'}
+    
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env
+        )
+        
+        traffic = defaultdict(lambda: {'sent': 0, 'recv': 0, 'rate_sent': 0, 'rate_recv': 0})
+        last_print = 0  # İlk güncelleme hemen olsun
+        
+        # İlk ekranı temizle
+        os.system('clear')
+        
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+            if not ready:
+                continue
+            
+            line = proc.stdout.readline()
+            if not line:
+                break
+            
+            app, ip, sent, recv = parse_nethogs_line(line)
+            
+            if app:
+                # Hariç tutulan IP kontrolü
+                if ip and ip in excluded:
+                    continue
+                
+                traffic[app]['rate_sent'] = sent
+                traffic[app]['rate_recv'] = recv
+                traffic[app]['sent'] += sent
+                traffic[app]['recv'] += recv
+            
+            # Her 5 saniyede ekranı güncelle
+            if time.time() - last_print >= NETHOGS_REFRESH_SEC:
+                # Ekranı temizle
+                os.system('clear')
+                
+                print("═" * 70)
+                print(f"  CANLI TRAFİK - {datetime.now().strftime('%H:%M:%S')}")
+                print(f"  Interface'ler: {', '.join(INTERFACES)}")
+                print("═" * 70)
+                print(f"\n{'Uygulama':<25} {'Hız ↑':<12} {'Hız ↓':<12} {'Toplam':<15}")
+                print("─" * 70)
+                
+                # Toplam trafiğe göre sırala
+                sorted_apps = sorted(
+                    traffic.items(), 
+                    key=lambda x: x[1]['sent'] + x[1]['recv'], 
+                    reverse=True
+                )[:15]  # En aktif 15 uygulama
+                
+                for app, data in sorted_apps:
+                    total = data['sent'] + data['recv']
+                    if total > 0:
+                        rate_up = format_bytes(data['rate_sent']) + "/s"
+                        rate_down = format_bytes(data['rate_recv']) + "/s"
+                        print(f"{app[:24]:<25} {rate_up:<12} {rate_down:<12} {format_bytes(total):<15}")
+                
+                print("\n" + "─" * 70)
+                print("Çıkış için Ctrl+C")
+                
+                last_print = time.time()
+                
+    except FileNotFoundError:
+        print("HATA: nethogs kurulu değil. Kurmak için: sudo apt install nethogs")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n\n✓ Canlı izleme sonlandırıldı")
+    finally:
+        if 'proc' in locals():
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
 def show_status():
     """Servis durumunu göster"""
     if PID_FILE.exists():
@@ -1357,6 +1455,7 @@ SERVİS KOMUTLARI:
     start               Daemon'u başlat (arka plan)
     stop                Daemon'u durdur
     status              Servis durumunu göster
+    -f                  Canlı trafik izleme (Ctrl+C ile çıkış)
 
 RAPOR KOMUTLARI:
     today               Bugünkü kullanım raporu
@@ -1536,6 +1635,12 @@ def main():
             PID_FILE.unlink(missing_ok=True)
         else:
             print("netmon zaten çalışmıyor")
+    
+    elif cmd == '-f' or cmd == 'live':
+        if os.geteuid() != 0:
+            print("Root yetkisi gerekli: sudo netmon -f")
+            sys.exit(1)
+        live_monitor()
     
     elif cmd == 'status':
         show_status()

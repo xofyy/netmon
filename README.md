@@ -1,52 +1,61 @@
-# netmon - Uygulama Bazlı Network Trafik İzleyici
+# netmon
 
-PLC ve diğer yerel cihazları hariç tutarak, internet kullanımını uygulama bazında izler ve raporlar.
+Uygulama bazlı network trafik izleyici. PLC ve diğer cihazları hariç tutarak internet kullanımını takip eder.
 
 ## Özellikler
 
-- ✅ **Sürekli veri toplama** - %100 trafik yakalama
-- ✅ Uygulama bazlı trafik izleme
-- ✅ **Çoklu interface desteği** (ethernet, docker, tailscale, wifi)
-- ✅ **Dinamik interface tespiti**
-- ✅ PLC/cihaz IP'lerini hariç tutma (IP validation ile)
-- ✅ Günlük, haftalık, aylık raporlar
-- ✅ **Webhook desteği** - Uzak sunucuya rapor gönderme
-- ✅ **JSON config dosyası** ile yapılandırma
-- ✅ Hafif ve minimal kaynak kullanımı
-- ✅ Systemd entegrasyonu
-- ✅ **Graceful shutdown** - Veri kaybı yok
+- 🔄 **Sürekli veri toplama** - Veri kaybı olmadan %100 trafik yakalama
+- 📊 **Zengin raporlar** - Günlük, haftalık, aylık trafik raporları
+- 🔴 **Canlı izleme** - Anlık trafik görselleştirme
+- 🚫 **IP hariç tutma** - PLC ve yerel cihazları filtrele
+- 🔔 **Webhook entegrasyonu** - Periyodik rapor gönderimi
+- 🐳 **Docker desteği** - Docker container trafiğini izleme
+- 🌐 **Dinamik interface** - Otomatik interface tespiti
+
+## Gereksinimler
+
+- Ubuntu 22.04 LTS veya üstü
+- Python 3.10+
+- nethogs
 
 ## Kurulum
 
 ```bash
-# Scripti indir
-git clone ... veya dosyaları kopyala
-
-# Kurulumu çalıştır
+# Depoyu klonla
+git clone https://github.com/user/netmon.git
 cd netmon
-sudo ./install.sh
+
+# Kurulum scriptini çalıştır
+sudo ./scripts/install.sh
+```
+
+Veya manuel kurulum:
+
+```bash
+# nethogs kur
+sudo apt install nethogs
+
+# Python paketini kur
+sudo pip install -e .
+
+# Servisi başlat
+sudo systemctl start netmon
+sudo systemctl enable netmon
 ```
 
 ## Kullanım
 
-### Servis Yönetimi
+### Servis Kontrolü
 
 ```bash
-# Başlat
-sudo systemctl start netmon
+# Daemon başlat
+sudo netmon start --daemon
 
-# Durdur
-sudo systemctl stop netmon
-
-# Durum
+# Durumu kontrol et
 netmon status
-# veya
-systemctl status netmon
 
-# Loglar
-journalctl -u netmon -f
-# veya
-tail -f /var/lib/netmon/netmon.log
+# Daemon durdur
+sudo netmon stop
 ```
 
 ### Raporlar
@@ -58,189 +67,152 @@ netmon today
 # Son 7 gün
 netmon week
 
-# Son 30 gün
+# Son 30 gün  
 netmon month
 
-# En çok kullanan uygulamalar
+# En çok kullanan 10 uygulama
 netmon top 10
 ```
 
-### Unknown Trafik Analizi
-
-Bazı trafik kaynaklarını nethogs tespit edemeyebilir (kernel trafiği, kısa ömürlü bağlantılar vb.). Bu trafiği analiz etmek için:
+### Canlı İzleme
 
 ```bash
-# Son 7 günün unknown trafiğini göster
-netmon unknown
+# Anlık trafik görselleştirme
+sudo netmon -f
 
-# Son 30 günün unknown trafiğini göster
-netmon unknown 30
+# veya
+sudo netmon live
 ```
 
-Çıktı, unknown trafiğin hangi IP adreslerine gittiğini gösterir. Bilinen cihazları (PLC, yazıcı vb.) `exclude` listesine ekleyebilirsiniz.
-
-### Veritabanı Bakımı
-
-Eski sürümlerden kalan hatalı kayıtları düzeltmek için:
+### IP Hariç Tutma
 
 ```bash
-# Geçersiz uygulama adlarını (PID, IP:port) düzelt
-netmon cleanup
-```
-
-### PLC/Cihaz IP'lerini Hariç Tutma
-
-```bash
-# IP ekle (IP validation ile)
-sudo netmon exclude add 192.168.1.50 "PLC1 Torna"
-sudo netmon exclude add 192.168.1.51 "PLC2 Freze"
-sudo netmon exclude add 5.5.5.10 "Ana PLC"
-
-# Listeyi görüntüle
-netmon exclude list
+# IP ekle
+sudo netmon exclude add 192.168.1.100 "PLC Ana"
 
 # IP kaldır
-sudo netmon exclude remove 192.168.1.50
+sudo netmon exclude remove 192.168.1.100
+
+# Listeyi göster
+netmon exclude list
 ```
 
-### Webhook Yapılandırması
+### Webhook
 
 ```bash
-# Webhook ayarla (60 dakikada bir gönderim)
+# Webhook ayarla (60 dakikada bir gönder)
 sudo netmon webhook set https://api.example.com/netmon 60
 
-# Durumu görüntüle
+# Durumu göster
 netmon webhook status
 
 # Test gönderimi
 netmon webhook test
 
-# Gönderilecek JSON'u görüntüle
-netmon webhook payload
-
-# Webhook'u devre dışı bırak/etkinleştir
+# Devre dışı bırak
 sudo netmon webhook disable
-sudo netmon webhook enable
-
-# Webhook'u kaldır
-sudo netmon webhook remove
 ```
 
 ### Yapılandırma
 
 ```bash
-# Aktif interface'leri göster
-netmon interfaces
-
-# DB yazma aralığını göster
-netmon interval
-
-# DB yazma aralığını değiştir (dakika cinsinden)
-sudo netmon interval set 10
-
-# Tüm yapılandırmayı göster
+# Yapılandırmayı göster
 netmon config show
+
+# DB yazma aralığını değiştir (dakika)
+sudo netmon config set db_write_interval 600
+
+# Interface listele
+netmon interfaces
 ```
 
-## Örnek Çıktı
+### Bakım
 
-```
-══════════════════════════════════════════════════════════════════════
-  SON 7 GÜNLÜK KULLANIM
-  Toplam: 12.45 GB
-══════════════════════════════════════════════════════════════════════
+```bash
+# Geçersiz uygulama adlarını düzelt
+netmon cleanup
 
-Uygulama                  Gönderim     Alım         Toplam       %     
-──────────────────────────────────────────────────────────────────────
-firefox                   1.23 GB      4.56 GB      5.79 GB      46.5% █████████
-apt                       12.34 MB     2.10 GB      2.11 GB      17.0% ███
-docker                    456.78 MB    1.23 GB      1.69 GB      13.6% ██
-code                      89.12 MB     892.34 MB    981.46 MB     7.7% █
-ssh                       123.45 MB    234.56 MB    358.01 MB     2.8% 
+# Tespit edilemeyen trafik detayı
+netmon unknown 7
 ```
 
 ## Yapılandırma Dosyası
 
-Config dosyası: `/etc/netmon/config.json`
+Konum: `/etc/netmon/config.yaml`
+
+```yaml
+# Network interfaces (boş = otomatik tespit)
+interfaces: []
+
+# DB yazma aralığı (saniye)
+db_write_interval: 300
+
+# Veri saklama süresi (gün)
+data_retention_days: 90
+
+# Log seviyesi
+log_level: INFO
+```
+
+## Webhook JSON Formatı
 
 ```json
 {
-  "interfaces": [],
-  "db_write_interval": 300,
-  "data_retention_days": 90,
-  "log_level": "INFO"
+  "version": "2.0",
+  "hostname": "server-01",
+  "timestamp": "2026-01-13T15:30:00+00:00",
+  "report_period": "daily",
+  "summary": {
+    "total_bytes": 1073741824,
+    "total_formatted": "1.00 GB",
+    "application_count": 15
+  },
+  "applications": [
+    {
+      "name": "firefox",
+      "bytes_total": 536870912,
+      "total_formatted": "512.00 MB",
+      "percentage": 50.0
+    }
+  ],
+  "excluded_ips": [
+    {"ip": "5.5.5.100", "description": "PLC 1"}
+  ]
 }
 ```
 
-| Parametre | Varsayılan | Açıklama |
-|-----------|------------|----------|
-| `interfaces` | `[]` (otomatik) | İzlenecek network interface listesi |
-| `db_write_interval` | `300` (5 dk) | Buffer'dan DB'ye yazma aralığı (saniye) |
-| `data_retention_days` | `90` | Eski verilerin tutulma süresi (gün) |
-| `log_level` | `INFO` | Log detay seviyesi (DEBUG, INFO, WARNING, ERROR) |
-
-## Mimari
-
-netmon sürekli veri toplama modeli kullanır:
-
-1. **nethogs** sürekli çalışır ve tüm network trafiğini izler
-2. **Reader Thread** nethogs çıktısını sürekli okur ve RAM buffer'a yazar
-3. **Writer Thread** periyodik olarak (varsayılan 5 dk) buffer'ı SQLite'a yazar
-4. **Webhook Thread** yapılandırılmış aralıklarla rapor gönderir
-
-Bu mimari sayesinde **%100 trafik yakalanır**, veri kaybı olmaz.
-
-## Desteklenen Interface'ler
-
-Otomatik tespit edilen interface türleri:
-- `eth*`, `enp*`, `ens*`, `eno*` - Ethernet
-- `wlan*`, `wlp*` - WiFi
-- `docker0` - Docker ana bridge
-- `tailscale*` - Tailscale VPN
-
-Hariç tutulan:
-- `lo` - Loopback
-- `veth*` - Docker container virtual interfaces
-- `br-*` - Docker bridge networks
-- `virbr*` - Libvirt bridges
-
-## Veritabanı
-
-Veriler SQLite'da saklanır:
-- Konum: `/var/lib/netmon/traffic.db`
-- Tablo: `traffic` (uygulama, remote_ip, bytes_sent, bytes_recv)
-- Tablo: `excluded_ips` (hariç tutulan IP'ler)
-- Tablo: `webhook_config` (webhook ayarları)
-- Tablo: `webhook_logs` (gönderim logları)
-
-WAL (Write-Ahead Logging) modu ile concurrent erişim desteklenir.
-
-## Gereksinimler
-
-- Python 3.8+
-- nethogs
-- SQLite3 (Python ile birlikte gelir)
-
-## Log Dosyası
-
-Log dosyası: `/var/lib/netmon/netmon.log`
+## Systemd
 
 ```bash
-# Logları takip et
-tail -f /var/lib/netmon/netmon.log
+# Servis durumu
+sudo systemctl status netmon
 
-# Son 100 satır
-tail -100 /var/lib/netmon/netmon.log
+# Logları görüntüle
+sudo journalctl -u netmon -f
+
+# Servisi yeniden başlat
+sudo systemctl restart netmon
 ```
 
-## Kaldırma
+## Dosya Konumları
+
+| Dosya | Konum |
+|-------|-------|
+| Yapılandırma | `/etc/netmon/config.yaml` |
+| Veritabanı | `/var/lib/netmon/traffic.db` |
+| Log dosyası | `/var/log/netmon.log` |
+| PID dosyası | `/var/run/netmon.pid` |
+
+## Geliştirme
 
 ```bash
-sudo systemctl stop netmon
-sudo systemctl disable netmon
-sudo rm /etc/systemd/system/netmon.service
-sudo rm /usr/local/bin/netmon
-sudo rm -rf /var/lib/netmon
-sudo rm -rf /etc/netmon
-sudo systemctl daemon-reload
+# Geliştirme modunda kur
+pip install -e .
+
+# Test modunda çalıştır
+sudo netmon test 60
 ```
+
+## Lisans
+
+MIT

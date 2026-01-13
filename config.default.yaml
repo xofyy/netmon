@@ -1,0 +1,28 @@
+# netmon Configuration
+# Copy to /etc/netmon/config.yaml
+
+# Network interfaces to monitor (empty = auto-detect)
+interfaces: []
+
+# Database write interval in seconds
+db_write_interval: 300
+
+# Data retention period in days
+data_retention_days: 90
+
+# Logging level (DEBUG, INFO, WARNING, ERROR)
+log_level: INFO
+
+# nethogs refresh interval in seconds
+nethogs_refresh_sec: 5
+
+# Main loop check interval in seconds
+main_loop_check_sec: 10
+
+# Paths
+paths:
+  config_dir: /etc/netmon
+  data_dir: /var/lib/netmon
+  log_file: /var/log/netmon.log
+  pid_file: /var/run/netmon.pid
+  db_file: /var/lib/netmon/traffic.db
