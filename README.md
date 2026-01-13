@@ -29,7 +29,32 @@ cd netmon
 sudo ./scripts/install.sh
 ```
 
-Veya manuel kurulum:
+### Installer Komutları
+
+```bash
+# Yeni kurulum (sessiz mod)
+sudo ./scripts/install.sh
+
+# Etkileşimli kurulum (sorular sorar)
+sudo ./scripts/install.sh -i
+
+# Güncelleme (veriyi korur)
+sudo ./scripts/install.sh upgrade
+
+# Kaldırma
+sudo ./scripts/install.sh uninstall
+
+# Kaldırma (veriyi koru)
+sudo ./scripts/install.sh uninstall --keep-data
+
+# Kurulum durumu
+./scripts/install.sh status
+
+# Yardım
+./scripts/install.sh --help
+```
+
+### Manuel Kurulum
 
 ```bash
 # nethogs kur
