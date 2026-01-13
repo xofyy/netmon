@@ -1,0 +1,1691 @@
+#!/usr/bin/env python3
+"""
+netmon - Uygulama Bazlı Network Trafik İzleyici
+PLC ve diğer cihazları hariç tutarak internet kullanımını takip eder.
+Sürekli veri toplama modeli ile %100 trafik yakalama.
+"""
+
+import sqlite3
+import subprocess
+import sys
+import os
+import signal
+import time
+import re
+import json
+import socket
+import urllib.request
+import urllib.error
+import logging
+import ipaddress
+import select
+from datetime import datetime, timedelta
+from pathlib import Path
+from collections import defaultdict
+from threading import Thread, Event, Lock
+
+# ═══════════════════════════════════════════════════════════════
+# YAPILANDIRMA
+# ═══════════════════════════════════════════════════════════════
+
+CONFIG_DIR = Path("/etc/netmon")
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DATA_DIR = Path("/var/lib/netmon")
+DB_PATH = DATA_DIR / "traffic.db"
+PID_FILE = Path("/var/run/netmon.pid")
+LOG_FILE = DATA_DIR / "netmon.log"
+
+# Varsayılan yapılandırma
+DEFAULT_CONFIG = {
+    "interfaces": [],  # Boş = otomatik tespit
+    "db_write_interval": 300,  # 5 dakika (saniye)
+    "data_retention_days": 90,  # 90 gün sonra eski veri silinir
+    "log_level": "INFO",
+}
+
+# Global değişkenler
+INTERFACES = None  # Dinamik tespit edilecek
+DB_WRITE_INTERVAL = 300  # Config'den yüklenecek
+DATA_RETENTION_DAYS = 90
+LOG_LEVEL = "INFO"
+
+# Sabit değerler
+NETHOGS_REFRESH_SEC = 5      # nethogs -d parametresi (saniye)
+MAIN_LOOP_CHECK_SEC = 10     # Ana döngü kontrol aralığı (saniye)
+BYTES_PER_KB = 1024          # KB -> Byte dönüşümü
+
+# Thread senkronizasyonu
+shutdown_event = Event()  # Graceful shutdown için
+buffer_lock = Lock()  # Buffer thread-safety için
+traffic_buffer = defaultdict(lambda: {'sent': 0, 'recv': 0, 'ips': set()})
+nethogs_process = None  # Global nethogs process referansı
+
+# Varsayılan hariç tutulacak IP'ler (PLC'ler)
+DEFAULT_EXCLUDED_IPS = [
+    ("5.5.5.100", "PLC 1"),
+    ("5.5.5.101", "PLC 2"),
+    ("5.5.5.102", "PLC 3"),
+    ("5.5.5.103", "PLC 4"),
+]
+
+# ═══════════════════════════════════════════════════════════════
+# LOGGING AYARLARI
+# ═══════════════════════════════════════════════════════════════
+
+def setup_logging():
+    """Logging sistemini başlat"""
+    global LOG_LEVEL
+    
+    # Log dizinini oluştur
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Log seviyesini belirle
+    level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+    
+    # Handlers
+    handlers = [logging.StreamHandler()]  # Console
+    
+    # Dosya handler (dizin varsa)
+    if DATA_DIR.exists():
+        try:
+            file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+            handlers.append(file_handler)
+        except Exception:
+            pass  # Dosya oluşturulamazsa sadece console
+    
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=handlers
+    )
+    
+    return logging.getLogger('netmon')
+
+# Logger başlat (henüz config yüklenmedi)
+logger = logging.getLogger('netmon')
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG YÖNETİMİ
+# ═══════════════════════════════════════════════════════════════
+
+def load_config():
+    """Config dosyasını yükle ve global değişkenleri ayarla"""
+    global INTERFACES, DB_WRITE_INTERVAL, DATA_RETENTION_DAYS, LOG_LEVEL, logger
+    
+    config = DEFAULT_CONFIG.copy()
+    
+    # Config dosyası varsa oku
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                user_config = json.load(f)
+                config.update(user_config)
+                logger.info(f"Config yüklendi: {CONFIG_FILE}")
+        except Exception as e:
+            logger.warning(f"Config okunamadı, varsayılanlar kullanılıyor: {e}")
+    
+    # Global değişkenleri ayarla
+    INTERFACES = config.get('interfaces') or None  # Boş liste = None (otomatik)
+    DB_WRITE_INTERVAL = config.get('db_write_interval', 300)
+    DATA_RETENTION_DAYS = config.get('data_retention_days', 90)
+    LOG_LEVEL = config.get('log_level', 'INFO')
+    
+    # Logging'i yeniden yapılandır
+    logger = setup_logging()
+    
+    return config
+
+
+def save_config(config):
+    """Config dosyasını kaydet"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"Config kaydedildi: {CONFIG_FILE}")
+
+
+def get_current_config():
+    """Mevcut config'i oku veya varsayılanları döndür"""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+
+def update_config(key, value):
+    """Config'de tek bir değeri güncelle"""
+    config = get_current_config()
+    config[key] = value
+    save_config(config)
+    return config
+
+# ═══════════════════════════════════════════════════════════════
+# VERİTABANI FONKSİYONLARI
+# ═══════════════════════════════════════════════════════════════
+
+def get_db_connection():
+    """Thread-safe veritabanı bağlantısı al"""
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.execute('PRAGMA journal_mode=WAL')  # Concurrent erişim için
+    return conn
+
+
+def init_db():
+    """Veritabanını oluştur"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Trafik tablosu
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS traffic (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            app_name TEXT,
+            remote_ip TEXT,
+            bytes_sent INTEGER,
+            bytes_recv INTEGER
+        )
+    ''')
+    
+    # Hariç tutulan IP'ler
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS excluded_ips (
+            ip TEXT PRIMARY KEY,
+            description TEXT,
+            added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Webhook yapılandırması
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS webhook_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            endpoint_url TEXT,
+            interval_minutes INTEGER DEFAULT 60,
+            enabled INTEGER DEFAULT 0,
+            last_sent DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Webhook gönderim logları
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS webhook_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT,
+            response_code INTEGER,
+            message TEXT
+        )
+    ''')
+    
+    # İndeksler
+    c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON traffic(timestamp)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_app ON traffic(app_name)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_remote_ip ON traffic(remote_ip)')
+    
+    # Varsayılan IP'leri ekle (yoksa)
+    for ip, desc in DEFAULT_EXCLUDED_IPS:
+        c.execute('INSERT OR IGNORE INTO excluded_ips (ip, description) VALUES (?, ?)', 
+                  (ip, desc))
+    
+    conn.commit()
+    conn.close()
+
+
+def cleanup_old_data():
+    """Eski verileri temizle"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # DB'de UTC timestamp kullanıldığı için utcnow() kullanıyoruz
+    cutoff = datetime.utcnow() - timedelta(days=DATA_RETENTION_DAYS)
+    
+    c.execute('DELETE FROM traffic WHERE timestamp < ?', (cutoff.strftime('%Y-%m-%d %H:%M:%S'),))
+    deleted = c.rowcount
+    
+    if deleted > 0:
+        logger.info(f"Eski veri temizlendi: {deleted} kayıt silindi")
+        c.execute('VACUUM')  # Veritabanını sıkıştır
+    
+    # Eski webhook loglarını da temizle (son 1000 kayıt kalsın)
+    c.execute('''
+        DELETE FROM webhook_logs WHERE id NOT IN (
+            SELECT id FROM webhook_logs ORDER BY timestamp DESC LIMIT 1000
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# ═══════════════════════════════════════════════════════════════
+# IP HARİÇ TUTMA FONKSİYONLARI
+# ═══════════════════════════════════════════════════════════════
+
+def is_valid_ip(ip_string):
+    """IP adresinin geçerli olup olmadığını kontrol et"""
+    try:
+        ipaddress.ip_address(ip_string)
+        return True
+    except ValueError:
+        return False
+
+
+def get_excluded_ips():
+    """Hariç tutulan IP listesini al"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT ip FROM excluded_ips')
+    ips = set(row[0] for row in c.fetchall())
+    conn.close()
+    return ips
+
+
+def add_excluded_ip(ip, description=""):
+    """Hariç tutulacak IP ekle"""
+    # IP validation
+    if not is_valid_ip(ip):
+        print(f"✗ Geçersiz IP adresi: {ip}")
+        return False
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute('INSERT OR REPLACE INTO excluded_ips (ip, description) VALUES (?, ?)', 
+                  (ip, description))
+        conn.commit()
+        print(f"✓ Eklendi: {ip} ({description})")
+        return True
+    except Exception as e:
+        print(f"✗ Hata: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def remove_excluded_ip(ip):
+    """Hariç tutulan IP'yi kaldır"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('DELETE FROM excluded_ips WHERE ip = ?', (ip,))
+    if c.rowcount > 0:
+        print(f"✓ Kaldırıldı: {ip}")
+    else:
+        print(f"✗ Bulunamadı: {ip}")
+    conn.commit()
+    conn.close()
+
+
+def list_excluded_ips():
+    """Hariç tutulan IP'leri listele"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT ip, description, added_at FROM excluded_ips ORDER BY added_at')
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        print("Hariç tutulan IP yok.")
+        return
+    
+    print("\nHariç Tutulan IP'ler:")
+    print("─" * 60)
+    print(f"{'IP':<18} {'Açıklama':<25} {'Eklenme Tarihi':<20}")
+    print("─" * 60)
+    for ip, desc, added in rows:
+        print(f"{ip:<18} {desc or '-':<25} {added[:16]:<20}")
+    print()
+
+# ═══════════════════════════════════════════════════════════════
+# INTERFACE TESPİTİ
+# ═══════════════════════════════════════════════════════════════
+
+def get_all_interfaces():
+    """İzlenecek tüm aktif interface'leri tespit et"""
+    interfaces = []
+    
+    # Hariç tutulacak interface pattern'leri
+    EXCLUDE_PATTERNS = ('lo', 'veth', 'br-', 'virbr')
+    
+    # Dahil edilecek interface pattern'leri
+    INCLUDE_PATTERNS = (
+        'eth', 'enp', 'ens', 'eno',  # Ethernet
+        'wlan', 'wlp',                # WiFi
+        'docker0',                    # Docker ana bridge
+        'tailscale',                  # Tailscale VPN
+    )
+    
+    try:
+        result = subprocess.run(
+            ['ip', '-o', 'link', 'show', 'up'],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, 'LANG': 'C'}
+        )
+        
+        for line in result.stdout.splitlines():
+            match = re.search(r'^\d+:\s+(\S+?)[@:]', line)
+            if match:
+                iface = match.group(1)
+                
+                # Hariç tutulanları atla
+                if any(iface.startswith(p) for p in EXCLUDE_PATTERNS):
+                    continue
+                
+                # Dahil edilecekleri ekle
+                if any(iface.startswith(p) for p in INCLUDE_PATTERNS):
+                    interfaces.append(iface)
+                    
+    except Exception as e:
+        logger.error(f"Interface tespit hatası: {e}")
+    
+    if not interfaces:
+        interfaces = ['eth0']
+        
+    return list(set(interfaces))  # Duplikatları kaldır
+
+
+def get_default_interface():
+    """Varsayılan internet interface'ini tespit et"""
+    try:
+        result = subprocess.run(
+            ['ip', 'route', 'get', '8.8.8.8'],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, 'LANG': 'C'}
+        )
+        if result.returncode == 0:
+            match = re.search(r'dev\s+(\S+)', result.stdout)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return 'eth0'
+
+
+def show_interfaces():
+    """Tespit edilen interface'leri göster"""
+    interfaces = get_all_interfaces()
+    default = get_default_interface()
+    
+    print("\n═══════════════════════════════════════════════════")
+    print("  AKTİF NETWORK INTERFACE'LERİ")
+    print("═══════════════════════════════════════════════════\n")
+    
+    for iface in sorted(interfaces):
+        marker = " (varsayılan)" if iface == default else ""
+        print(f"  • {iface}{marker}")
+    
+    print(f"\nToplam: {len(interfaces)} interface")
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════
+# YARDIMCI FONKSİYONLAR
+# ═══════════════════════════════════════════════════════════════
+
+def format_bytes(bytes_val):
+    """Byte değerini okunabilir formata çevir"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024:
+            return f"{bytes_val:.2f} {unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.2f} PB"
+
+def parse_nethogs_line(line):
+    """
+    nethogs trace çıktısını parse et
+    
+    Örnek formatlar:
+    - /usr/bin/firefox/12345/192.168.1.5:443-10.0.0.1:54321	1.234	5.678
+    - /usr/bin/python3/1234	0.5	1.2
+    - firefox/12345	0.5	1.2
+    - unknown TCP/0/0	0	0
+    """
+    line = line.strip()
+    
+    # Boş satır veya refresh satırlarını atla
+    if not line or line.startswith('Refreshing') or line.startswith('/'):
+        if not line or line.startswith('Refreshing'):
+            return None, None, 0, 0
+    
+    parts = line.split('\t')
+    if len(parts) < 3:
+        return None, None, 0, 0
+    
+    try:
+        prog_info = parts[0]
+        sent = float(parts[1]) * BYTES_PER_KB  # KB -> Bytes
+        recv = float(parts[2]) * BYTES_PER_KB
+        
+        # Uygulama adını çıkar
+        app_name = None
+        remote_ip = None
+        
+        # Path varsa executable'ı bul
+        if '/' in prog_info:
+            path_parts = prog_info.split('/')
+            
+            # PID'den önceki kısmı bul (sayı olan ilk parça)
+            for i, part in enumerate(path_parts):
+                if part.isdigit():
+                    # PID bulundu, bir önceki uygulama adı
+                    if i > 0:
+                        app_name = path_parts[i-1]
+                    break
+            
+            # Bulunamadıysa, bilinen path'lerden çıkar
+            if not app_name:
+                for part in reversed(path_parts):
+                    if part and not part.isdigit() and ':' not in part and '-' not in part:
+                        app_name = part
+                        break
+        else:
+            # Sadece binary/PID veya binary formatı
+            app_name = prog_info.split('/')[0].split('-')[0]
+        
+        # Remote IP'yi çıkar (varsa)
+        # Format: local_ip:port-remote_ip:port
+        ip_pattern = r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+'
+        ip_match = re.search(ip_pattern, prog_info)
+        if ip_match:
+            remote_ip = ip_match.group(2)  # Remote IP (ikinci grup)
+        else:
+            # Tek IP varsa onu al
+            single_ip = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', prog_info)
+            if single_ip:
+                remote_ip = single_ip.group(1)
+        
+        # Temizlik - Geçersiz uygulama adlarını kontrol et
+        if app_name:
+            app_name = app_name.strip()
+            # Geçersiz uygulama adı kontrolleri:
+            # 1. Sadece sayı (PID)
+            # 2. IP adresi formatı (192.168.x.x gibi)
+            # 3. IP:port-IP:port formatı (bağlantı bilgisi)
+            # 4. Bilinen geçersiz değerler
+            is_invalid = (
+                app_name.isdigit() or  # PID
+                re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', app_name) or  # IP adresi
+                re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+-', app_name) or  # IP:port-...
+                app_name in ('unknown', 'TCP', 'UDP', '')
+            )
+            if is_invalid:
+                app_name = 'unknown'
+        else:
+            app_name = 'unknown'
+        
+        return app_name, remote_ip, sent, recv
+        
+    except (ValueError, IndexError) as e:
+        logger.debug(f"Parse hatası: {line} - {e}")
+        return None, None, 0, 0
+
+# ═══════════════════════════════════════════════════════════════
+# SÜREKLİ TOPLAMA MODELİ - READER/WRITER THREAD'LERİ
+# ═══════════════════════════════════════════════════════════════
+
+def nethogs_reader(proc, excluded_ips):
+    """
+    nethogs stdout'u sürekli oku ve buffer'a ekle.
+    Bu thread daemon boyunca çalışır.
+    """
+    global traffic_buffer
+    
+    logger.info("Reader thread başlatıldı")
+    
+    while not shutdown_event.is_set():
+        try:
+            # Non-blocking okuma için select kullan
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if not ready:
+                continue
+            
+            line = proc.stdout.readline()
+            if not line:
+                # Process sonlandıysa
+                if proc.poll() is not None:
+                    logger.warning("nethogs process sonlandı")
+                    break
+                continue
+            
+            app, ip, sent, recv = parse_nethogs_line(line)
+            
+            if app:
+                # Hariç tutulan IP kontrolü
+                if ip and ip in excluded_ips:
+                    continue
+                
+                # Thread-safe buffer güncellemesi (unknown dahil)
+                with buffer_lock:
+                    traffic_buffer[app]['sent'] += sent
+                    traffic_buffer[app]['recv'] += recv
+                    if ip:
+                        traffic_buffer[app]['ips'].add(ip)
+                        
+        except Exception as e:
+            if not shutdown_event.is_set():
+                logger.debug(f"Reader hatası: {e}")
+            continue
+    
+    logger.info("Reader thread sonlandı")
+
+
+def db_writer():
+    """
+    Periyodik olarak buffer'ı DB'ye yaz.
+    Bu thread daemon boyunca çalışır.
+    """
+    global traffic_buffer
+    
+    logger.info(f"Writer thread başlatıldı (interval: {DB_WRITE_INTERVAL}s)")
+    last_cleanup = datetime.now()
+    
+    while not shutdown_event.is_set():
+        # Interruptible sleep
+        shutdown_event.wait(timeout=DB_WRITE_INTERVAL)
+        
+        if shutdown_event.is_set():
+            break
+        
+        # Buffer'ı al ve sıfırla (thread-safe)
+        with buffer_lock:
+            current_buffer = dict(traffic_buffer)
+            traffic_buffer.clear()
+        
+        # DB'ye yaz
+        if current_buffer:
+            try:
+                save_traffic(current_buffer)
+                logger.info(f"DB'ye yazıldı: {len(current_buffer)} uygulama")
+            except Exception as e:
+                logger.error(f"DB yazma hatası: {e}")
+        
+        # Günlük temizlik (24 saatte bir)
+        if (datetime.now() - last_cleanup).days >= 1:
+            try:
+                cleanup_old_data()
+                last_cleanup = datetime.now()
+            except Exception as e:
+                logger.error(f"Cleanup hatası: {e}")
+    
+    # Shutdown: son buffer'ı kaydet
+    with buffer_lock:
+        final_buffer = dict(traffic_buffer)
+        traffic_buffer.clear()
+    
+    if final_buffer:
+        try:
+            save_traffic(final_buffer)
+            logger.info(f"Son buffer kaydedildi: {len(final_buffer)} uygulama")
+        except Exception as e:
+            logger.error(f"Son buffer kaydetme hatası: {e}")
+    
+    logger.info("Writer thread sonlandı")
+
+
+def start_nethogs():
+    """nethogs process'ini başlat"""
+    global INTERFACES, nethogs_process
+    
+    if INTERFACES is None:
+        INTERFACES = get_all_interfaces()
+    
+    cmd = ['nethogs', '-t', '-d', str(NETHOGS_REFRESH_SEC)] + INTERFACES
+    logger.info(f"nethogs başlatılıyor: {' '.join(cmd)}")
+    
+    # Locale sorununu önle
+    env = {**os.environ, 'LANG': 'C', 'LC_ALL': 'C'}
+    
+    try:
+        nethogs_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env
+        )
+        return nethogs_process
+    except FileNotFoundError:
+        logger.error("nethogs kurulu değil! Kurmak için: sudo apt install nethogs")
+        sys.exit(1)
+
+
+def collect_traffic(duration=60):
+    """
+    Eski API uyumluluğu için - Test modunda kullanılır.
+    Gerçek daemon sürekli toplama kullanır.
+    """
+    global INTERFACES
+    
+    if INTERFACES is None:
+        INTERFACES = get_all_interfaces()
+    
+    excluded = get_excluded_ips()
+    traffic_data = defaultdict(lambda: {'sent': 0, 'recv': 0, 'ips': set()})
+    
+    try:
+        cmd = ['nethogs', '-t', '-d', str(NETHOGS_REFRESH_SEC)] + INTERFACES
+        env = {**os.environ, 'LANG': 'C', 'LC_ALL': 'C'}
+        
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env
+        )
+        
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            # Non-blocking okuma
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if not ready:
+                continue
+                
+            line = proc.stdout.readline()
+            if not line:
+                break
+            
+            app, ip, sent, recv = parse_nethogs_line(line)
+            if app and app != 'unknown':
+                if ip and ip in excluded:
+                    continue
+                
+                traffic_data[app]['sent'] += sent
+                traffic_data[app]['recv'] += recv
+                if ip:
+                    traffic_data[app]['ips'].add(ip)
+        
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            
+    except FileNotFoundError:
+        print("HATA: nethogs kurulu değil. Kurmak için: sudo apt install nethogs")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Veri toplama hatası: {e}")
+    
+    return traffic_data
+
+def save_traffic(traffic_data):
+    """Trafik verisini veritabanına kaydet"""
+    if not traffic_data:
+        return
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    for app, data in traffic_data.items():
+        if data['sent'] > 0 or data['recv'] > 0:
+            # IP bilgisi varsa kaydet, yoksa NULL
+            ips = list(data.get('ips', set()))
+            if ips:
+                # Her IP için ayrı kayıt (trafiği IP sayısına böl)
+                per_ip_sent = int(data['sent'] / len(ips))
+                per_ip_recv = int(data['recv'] / len(ips))
+                for ip in ips:
+                    c.execute('''
+                        INSERT INTO traffic (app_name, remote_ip, bytes_sent, bytes_recv)
+                        VALUES (?, ?, ?, ?)
+                    ''', (app, ip, per_ip_sent, per_ip_recv))
+            else:
+                # IP bilgisi yoksa NULL olarak kaydet
+                c.execute('''
+                    INSERT INTO traffic (app_name, remote_ip, bytes_sent, bytes_recv)
+                    VALUES (?, ?, ?, ?)
+                ''', (app, None, int(data['sent']), int(data['recv'])))
+    
+    conn.commit()
+    conn.close()
+    logger.debug(f"Trafik kaydedildi: {len(traffic_data)} uygulama")
+
+# ═══════════════════════════════════════════════════════════════
+# WEBHOOK FONKSİYONLARI
+# ═══════════════════════════════════════════════════════════════
+
+def get_webhook_config():
+    """Webhook yapılandırmasını al"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT endpoint_url, interval_minutes, enabled, last_sent FROM webhook_config WHERE id = 1')
+    row = c.fetchone()
+    conn.close()
+    
+    if row:
+        return {
+            'url': row[0],
+            'interval': row[1],
+            'enabled': bool(row[2]),
+            'last_sent': row[3]
+        }
+    return None
+
+
+def set_webhook(url, interval=60):
+    """Webhook endpoint'i ayarla"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO webhook_config (id, endpoint_url, interval_minutes, enabled)
+        VALUES (1, ?, ?, 1)
+    ''', (url, interval))
+    conn.commit()
+    conn.close()
+    print(f"✓ Webhook ayarlandı")
+    print(f"  URL: {url}")
+    print(f"  Gönderim aralığı: {interval} dakika")
+
+
+def disable_webhook():
+    """Webhook'u devre dışı bırak"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('UPDATE webhook_config SET enabled = 0 WHERE id = 1')
+    conn.commit()
+    conn.close()
+    print("✓ Webhook devre dışı bırakıldı")
+
+
+def enable_webhook():
+    """Webhook'u etkinleştir"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('UPDATE webhook_config SET enabled = 1 WHERE id = 1')
+    if c.rowcount > 0:
+        conn.commit()
+        print("✓ Webhook etkinleştirildi")
+    else:
+        print("✗ Önce webhook ayarlayın: netmon webhook set <url>")
+    conn.close()
+
+def get_report_data(days=1):
+    """Rapor verisini dict olarak al"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # DB'de UTC timestamp kullanıldığı için utcnow() kullanıyoruz
+    since = datetime.utcnow() - timedelta(days=days)
+    
+    c.execute('''
+        SELECT app_name, 
+               SUM(bytes_sent) as total_sent,
+               SUM(bytes_recv) as total_recv,
+               SUM(bytes_sent + bytes_recv) as total
+        FROM traffic
+        WHERE timestamp > ?
+        GROUP BY app_name
+        ORDER BY total DESC
+    ''', (since.strftime('%Y-%m-%d %H:%M:%S'),))
+    
+    rows = c.fetchall()
+    
+    # Hariç tutulan IP'ler
+    c.execute('SELECT ip, description FROM excluded_ips')
+    excluded = [{'ip': row[0], 'description': row[1]} for row in c.fetchall()]
+    
+    conn.close()
+    
+    total_all = sum(row[3] for row in rows) if rows else 0
+    
+    applications = []
+    for app, sent, recv, total in rows:
+        pct = (total / total_all * 100) if total_all > 0 else 0
+        applications.append({
+            'name': app,
+            'bytes_sent': sent,
+            'bytes_recv': recv,
+            'bytes_total': total,
+            'sent_formatted': format_bytes(sent),
+            'recv_formatted': format_bytes(recv),
+            'total_formatted': format_bytes(total),
+            'percentage': round(pct, 2)
+        })
+    
+    return {
+        'total_sent': sum(row[1] for row in rows) if rows else 0,
+        'total_recv': sum(row[2] for row in rows) if rows else 0,
+        'total': total_all,
+        'applications': applications,
+        'excluded_ips': excluded
+    }
+
+def build_webhook_payload(period='daily'):
+    """Webhook için JSON payload oluştur"""
+    
+    days_map = {
+        'hourly': 1/24,
+        'daily': 1,
+        'weekly': 7,
+        'monthly': 30
+    }
+    days = days_map.get(period, 1)
+    
+    report = get_report_data(days=days)
+    
+    payload = {
+        'version': '1.0',
+        'hostname': socket.gethostname(),
+        'timestamp': datetime.now().isoformat(),
+        'report_period': period,
+        'report_generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'interfaces': INTERFACES or get_all_interfaces(),
+        'summary': {
+            'total_bytes_sent': report['total_sent'],
+            'total_bytes_recv': report['total_recv'],
+            'total_bytes': report['total'],
+            'total_sent_formatted': format_bytes(report['total_sent']),
+            'total_recv_formatted': format_bytes(report['total_recv']),
+            'total_formatted': format_bytes(report['total']),
+            'application_count': len(report['applications'])
+        },
+        'applications': report['applications'][:50],
+        'excluded_ips': report['excluded_ips']
+    }
+    
+    return payload
+
+def send_webhook(test=False):
+    """Webhook'a veri gönder"""
+    config = get_webhook_config()
+    
+    if not config or not config['url']:
+        print("✗ Webhook ayarlanmamış")
+        return False
+    
+    if not config['enabled'] and not test:
+        return False
+    
+    interval = config['interval']
+    if interval <= 60:
+        period = 'hourly'
+    elif interval <= 1440:
+        period = 'daily'
+    elif interval <= 10080:
+        period = 'weekly'
+    else:
+        period = 'monthly'
+    
+    payload = build_webhook_payload(period=period)
+    
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        
+        req = urllib.request.Request(
+            config['url'],
+            data=data,
+            headers={
+                'Content-Type': 'application/json',
+                'User-Agent': 'netmon/1.0',
+                'X-Netmon-Hostname': socket.gethostname()
+            },
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            status_code = response.getcode()
+            
+            log_webhook_result('success', status_code, 'OK')
+            
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('UPDATE webhook_config SET last_sent = ? WHERE id = 1', 
+                      (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
+            conn.commit()
+            conn.close()
+            
+            if test:
+                print(f"✓ Webhook başarıyla gönderildi (HTTP {status_code})")
+                print(f"  Gönderilen veri boyutu: {len(data)} byte")
+            
+            return True
+            
+    except urllib.error.HTTPError as e:
+        log_webhook_result('error', e.code, str(e))
+        if test:
+            print(f"✗ HTTP Hatası: {e.code} - {e.reason}")
+        return False
+        
+    except urllib.error.URLError as e:
+        log_webhook_result('error', 0, str(e))
+        if test:
+            print(f"✗ Bağlantı hatası: {e.reason}")
+        return False
+        
+    except Exception as e:
+        log_webhook_result('error', 0, str(e))
+        if test:
+            print(f"✗ Hata: {e}")
+        return False
+
+def log_webhook_result(status, code, message):
+    """Webhook sonucunu logla"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO webhook_logs (status, response_code, message)
+        VALUES (?, ?, ?)
+    ''', (status, code, message[:500]))
+    
+    c.execute('''
+        DELETE FROM webhook_logs WHERE id NOT IN (
+            SELECT id FROM webhook_logs ORDER BY timestamp DESC LIMIT 100
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def show_webhook_status():
+    """Webhook durumunu göster"""
+    config = get_webhook_config()
+    
+    print("\n═══════════════════════════════════════════════════")
+    print("  WEBHOOK DURUMU")
+    print("═══════════════════════════════════════════════════\n")
+    
+    if not config or not config['url']:
+        print("Durum: Yapılandırılmamış")
+        print("\nAyarlamak için:")
+        print("  netmon webhook set <url> [dakika]")
+        return
+    
+    status = "✓ Aktif" if config['enabled'] else "✗ Devre dışı"
+    print(f"Durum: {status}")
+    print(f"URL: {config['url']}")
+    print(f"Gönderim aralığı: {config['interval']} dakika")
+    print(f"Son gönderim: {config['last_sent'] or 'Henüz gönderilmedi'}")
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        SELECT timestamp, status, response_code, message 
+        FROM webhook_logs 
+        ORDER BY timestamp DESC 
+        LIMIT 5
+    ''')
+    logs = c.fetchall()
+    conn.close()
+    
+    if logs:
+        print("\nSon gönderimler:")
+        print("─" * 60)
+        for ts, status, code, msg in logs:
+            icon = "✓" if status == 'success' else "✗"
+            print(f"  {icon} {ts[:16]} - HTTP {code} - {msg[:40]}")
+    print()
+
+def show_webhook_payload():
+    """Gönderilecek JSON yapısını göster"""
+    payload = build_webhook_payload(period='daily')
+    print("\nGönderilecek JSON yapısı:")
+    print("─" * 60)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print()
+
+# ═══════════════════════════════════════════════════════════════
+# DAEMON
+# ═══════════════════════════════════════════════════════════════
+
+def webhook_worker():
+    """Webhook gönderim thread'i - Graceful shutdown destekli"""
+    logger.info("Webhook worker başlatıldı")
+    
+    while not shutdown_event.is_set():
+        try:
+            config = get_webhook_config()
+            if config and config['enabled'] and config['url']:
+                interval_sec = config['interval'] * 60
+                
+                if config['last_sent']:
+                    last = datetime.fromisoformat(config['last_sent'])
+                    elapsed = (datetime.now() - last).total_seconds()
+                    
+                    if elapsed >= interval_sec:
+                        send_webhook()
+                else:
+                    send_webhook()
+                
+                # Interruptible sleep
+                shutdown_event.wait(timeout=60)
+            else:
+                shutdown_event.wait(timeout=300)
+                
+        except Exception as e:
+            logger.error(f"Webhook worker hatası: {e}")
+            shutdown_event.wait(timeout=60)
+    
+    logger.info("Webhook worker sonlandı")
+
+
+def daemon_loop():
+    """
+    Ana daemon döngüsü - Sürekli toplama modeli
+    
+    Yapı:
+    - nethogs sürekli çalışır
+    - Reader thread sürekli okur ve buffer'a yazar
+    - Writer thread periyodik olarak DB'ye yazar
+    - Webhook thread periyodik rapor gönderir
+    """
+    global INTERFACES, nethogs_process
+    
+    # Config yükle
+    load_config()
+    
+    # Interface'leri tespit et
+    if INTERFACES is None:
+        INTERFACES = get_all_interfaces()
+    
+    logger.info("=" * 60)
+    logger.info("netmon daemon başlatıldı")
+    logger.info(f"İzlenen interface'ler: {', '.join(INTERFACES)}")
+    logger.info(f"DB yazma aralığı: {DB_WRITE_INTERVAL} saniye")
+    logger.info(f"Veri saklama süresi: {DATA_RETENTION_DAYS} gün")
+    logger.info("=" * 60)
+    
+    # PID dosyası
+    PID_FILE.write_text(str(os.getpid()))
+    
+    # Hariç tutulan IP'leri al
+    excluded_ips = get_excluded_ips()
+    logger.info(f"Hariç tutulan IP sayısı: {len(excluded_ips)}")
+    
+    def cleanup(signum, frame):
+        """Graceful shutdown handler"""
+        logger.info("Kapatma sinyali alındı, temizleniyor...")
+        shutdown_event.set()
+        
+        # nethogs process'i kapat
+        if nethogs_process and nethogs_process.poll() is None:
+            nethogs_process.terminate()
+            try:
+                nethogs_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                nethogs_process.kill()
+                nethogs_process.wait()
+        
+        PID_FILE.unlink(missing_ok=True)
+    
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    
+    # nethogs başlat
+    nethogs_process = start_nethogs()
+    
+    # Thread'leri başlat
+    reader_thread = Thread(
+        target=nethogs_reader, 
+        args=(nethogs_process, excluded_ips),
+        daemon=True, 
+        name='nethogs-reader'
+    )
+    
+    writer_thread = Thread(
+        target=db_writer, 
+        daemon=True, 
+        name='db-writer'
+    )
+    
+    webhook_thread = Thread(
+        target=webhook_worker, 
+        daemon=True, 
+        name='webhook-worker'
+    )
+    
+    reader_thread.start()
+    writer_thread.start()
+    webhook_thread.start()
+    
+    logger.info("Tüm worker thread'ler başlatıldı")
+    
+    # Ana döngü: Thread'leri izle ve nethogs'u yeniden başlat gerekirse
+    while not shutdown_event.is_set():
+        try:
+            # nethogs process kontrolü
+            if nethogs_process.poll() is not None:
+                logger.warning("nethogs sonlandı, yeniden başlatılıyor...")
+                time.sleep(5)
+                nethogs_process = start_nethogs()
+                
+                # Reader thread'i yeniden başlat
+                excluded_ips = get_excluded_ips()  # Güncel listeyi al
+                reader_thread = Thread(
+                    target=nethogs_reader, 
+                    args=(nethogs_process, excluded_ips),
+                    daemon=True, 
+                    name='nethogs-reader'
+                )
+                reader_thread.start()
+            
+            # Writer thread kontrolü
+            if not writer_thread.is_alive() and not shutdown_event.is_set():
+                logger.warning("Writer thread çöktü, yeniden başlatılıyor...")
+                writer_thread = Thread(target=db_writer, daemon=True, name='db-writer')
+                writer_thread.start()
+            
+            # Webhook thread kontrolü
+            if not webhook_thread.is_alive() and not shutdown_event.is_set():
+                logger.warning("Webhook thread çöktü, yeniden başlatılıyor...")
+                webhook_thread = Thread(target=webhook_worker, daemon=True, name='webhook-worker')
+                webhook_thread.start()
+            
+            # Periyodik kontrol
+            shutdown_event.wait(timeout=MAIN_LOOP_CHECK_SEC)
+            
+        except Exception as e:
+            logger.error(f"Ana döngü hatası: {e}")
+            shutdown_event.wait(timeout=MAIN_LOOP_CHECK_SEC)
+    
+    # Shutdown: thread'lerin bitmesini bekle
+    logger.info("Thread'lerin sonlanması bekleniyor...")
+    writer_thread.join(timeout=MAIN_LOOP_CHECK_SEC)
+    
+    logger.info("netmon daemon sonlandı")
+    sys.exit(0)
+
+# ═══════════════════════════════════════════════════════════════
+# RAPORLAR
+# ═══════════════════════════════════════════════════════════════
+
+def get_report(days=1, title=""):
+    """Belirli zaman aralığı için rapor oluştur"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # DB'de UTC timestamp kullanıldığı için utcnow() kullanıyoruz
+    since = datetime.utcnow() - timedelta(days=days)
+    
+    c.execute('''
+        SELECT app_name, 
+               SUM(bytes_sent) as total_sent,
+               SUM(bytes_recv) as total_recv,
+               SUM(bytes_sent + bytes_recv) as total
+        FROM traffic
+        WHERE timestamp > ?
+        GROUP BY app_name
+        ORDER BY total DESC
+    ''', (since.strftime('%Y-%m-%d %H:%M:%S'),))
+    
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        print(f"\n{title}")
+        print("Henüz veri yok.")
+        return
+    
+    total_all = sum(row[3] for row in rows)
+    
+    print(f"\n{'═' * 70}")
+    print(f"  {title}")
+    print(f"  Toplam: {format_bytes(total_all)}")
+    print(f"{'═' * 70}")
+    print(f"\n{'Uygulama':<25} {'Gönderim':<12} {'Alım':<12} {'Toplam':<12} {'%':<6}")
+    print("─" * 70)
+    
+    for app, sent, recv, total in rows[:20]:
+        pct = (total / total_all * 100) if total_all > 0 else 0
+        bar = "█" * int(pct / 5)
+        print(f"{app[:24]:<25} {format_bytes(sent):<12} {format_bytes(recv):<12} {format_bytes(total):<12} {pct:>5.1f}% {bar}")
+    
+    if len(rows) > 20:
+        print(f"\n... ve {len(rows) - 20} uygulama daha")
+    print()
+
+def fix_invalid_app_names():
+    """Veritabanındaki geçersiz uygulama adlarını düzelt"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Sayısal uygulama adları (PID'ler)
+    c.execute("UPDATE traffic SET app_name = 'unknown' WHERE app_name GLOB '[0-9]*'")
+    fixed_numeric = c.rowcount
+    
+    # IP:port formatındaki uygulama adları
+    c.execute("UPDATE traffic SET app_name = 'unknown' WHERE app_name LIKE '%.%.%.%:%'")
+    fixed_ip = c.rowcount
+    
+    conn.commit()
+    conn.close()
+    
+    total_fixed = fixed_numeric + fixed_ip
+    if total_fixed > 0:
+        print(f"✓ {total_fixed} kayıt düzeltildi:")
+        if fixed_numeric > 0:
+            print(f"  - {fixed_numeric} sayısal uygulama adı")
+        if fixed_ip > 0:
+            print(f"  - {fixed_ip} IP:port formatı")
+    else:
+        print("✓ Düzeltilecek kayıt bulunamadı")
+    
+    return total_fixed
+
+
+def show_unknown_traffic(days=7):
+    """Unknown trafiğin remote IP bazlı detayını göster"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # DB'de UTC timestamp kullanıldığı için utcnow() kullanıyoruz
+    since = datetime.utcnow() - timedelta(days=days)
+    
+    # Unknown trafik için remote IP bazlı özet
+    c.execute('''
+        SELECT remote_ip, 
+               SUM(bytes_sent) as total_sent,
+               SUM(bytes_recv) as total_recv,
+               SUM(bytes_sent + bytes_recv) as total,
+               COUNT(*) as count
+        FROM traffic
+        WHERE app_name = 'unknown' AND timestamp > ?
+        GROUP BY remote_ip
+        ORDER BY total DESC
+    ''', (since.strftime('%Y-%m-%d %H:%M:%S'),))
+    
+    rows = c.fetchall()
+    
+    # Toplam unknown trafik
+    c.execute('''
+        SELECT SUM(bytes_sent + bytes_recv) as total
+        FROM traffic
+        WHERE app_name = 'unknown' AND timestamp > ?
+    ''', (since.strftime('%Y-%m-%d %H:%M:%S'),))
+    
+    total_unknown = c.fetchone()[0] or 0
+    conn.close()
+    
+    if not rows:
+        print(f"\nSon {days} günde unknown trafik bulunamadı.")
+        return
+    
+    print(f"\n{'═' * 70}")
+    print(f"  UNKNOWN TRAFİK DETAYI (Son {days} gün)")
+    print(f"  Toplam: {format_bytes(total_unknown)}")
+    print(f"{'═' * 70}")
+    print(f"\n{'Remote IP':<24} {'Gönderim':<12} {'Alım':<12} {'Toplam':<12} {'Kayıt':<8}")
+    print("─" * 70)
+    
+    for ip, sent, recv, total, count in rows[:20]:
+        ip_display = ip if ip else "(yerel/bilinmeyen)"
+        ip_display = ip_display[:23]  # Uzun IP'leri kırp
+        print(f"{ip_display:<24} {format_bytes(sent):<12} {format_bytes(recv):<12} {format_bytes(total):<12} {count:<8}")
+    
+    if len(rows) > 20:
+        print(f"\n... ve {len(rows) - 20} IP daha")
+    
+    print()
+    print("İpucu: Bilinen cihazları hariç tutmak için:")
+    print("  sudo netmon exclude add <IP> \"Açıklama\"")
+    print()
+
+
+def show_status():
+    """Servis durumunu göster"""
+    if PID_FILE.exists():
+        pid = PID_FILE.read_text().strip()
+        try:
+            os.kill(int(pid), 0)
+            print(f"✓ netmon çalışıyor (PID: {pid})")
+            return True
+        except OSError:
+            print("✗ netmon çalışmıyor (eski PID dosyası)")
+            return False
+    else:
+        print("✗ netmon çalışmıyor")
+        return False
+
+def print_help():
+    """Yardım mesajı"""
+    help_text = """
+netmon - Uygulama Bazlı Network Trafik İzleyici
+Sürekli veri toplama ile %100 trafik yakalama.
+
+KULLANIM:
+    netmon <komut> [seçenekler]
+
+SERVİS KOMUTLARI:
+    start               Daemon'u başlat (arka plan)
+    stop                Daemon'u durdur
+    status              Servis durumunu göster
+
+RAPOR KOMUTLARI:
+    today               Bugünkü kullanım raporu
+    week                Son 7 günlük rapor
+    month               Son 30 günlük rapor
+    top [N]             En çok kullanan N uygulama
+    unknown [gün]       Tespit edilemeyen trafik detayı (varsayılan: 7 gün)
+
+IP HARİÇ TUTMA:
+    exclude add <IP> [açıklama]    PLC/cihaz IP'si ekle
+    exclude remove <IP>            IP'yi listeden çıkar
+    exclude list                   Hariç tutulan IP'leri göster
+
+WEBHOOK KOMUTLARI:
+    webhook set <url> [dakika]     Webhook endpoint ayarla
+    webhook remove                 Webhook'u kaldır
+    webhook enable                 Webhook'u etkinleştir
+    webhook disable                Webhook'u devre dışı bırak
+    webhook status                 Webhook durumunu göster
+    webhook test                   Test gönderimi yap
+    webhook payload                Gönderilecek JSON'u göster
+
+YAPILANDIRMA:
+    interfaces          Aktif network interface'lerini göster
+    interval            DB yazma aralığını göster
+    interval set <dk>   DB yazma aralığını değiştir (dakika)
+    config show         Tüm yapılandırmayı göster
+
+KURULUM:
+    install             Systemd servisi olarak kur
+
+BAKIM:
+    cleanup             Veritabanındaki geçersiz uygulama adlarını düzelt
+
+ÖRNEKLER:
+    netmon exclude add 5.5.5.104 "PLC5 CNC"
+    netmon webhook set https://api.example.com/netmon 60
+    netmon interval set 10
+    netmon today
+"""
+    print(help_text)
+
+
+def show_interval():
+    """Mevcut DB yazma aralığını göster"""
+    config = get_current_config()
+    interval = config.get('db_write_interval', 300)
+    
+    print("\n═══════════════════════════════════════════════════")
+    print("  DB YAZMA ARALIĞI")
+    print("═══════════════════════════════════════════════════\n")
+    print(f"Mevcut aralık: {interval} saniye ({interval // 60} dakika)")
+    print(f"\nHer {interval // 60} dakikada bir, toplanan trafik verisi")
+    print("veritabanına yazılır.")
+    print("\nDeğiştirmek için:")
+    print("  sudo netmon interval set <dakika>")
+    print()
+
+
+def set_interval(minutes):
+    """DB yazma aralığını değiştir"""
+    if minutes < 1:
+        print("✗ Aralık en az 1 dakika olmalı")
+        return False
+    
+    if minutes > 60:
+        print("✗ Aralık en fazla 60 dakika olabilir")
+        return False
+    
+    seconds = minutes * 60
+    config = get_current_config()
+    config['db_write_interval'] = seconds
+    save_config(config)
+    
+    print(f"✓ DB yazma aralığı {minutes} dakika ({seconds} saniye) olarak ayarlandı")
+    print("\nNot: Değişikliğin etkili olması için servisi yeniden başlatın:")
+    print("  sudo systemctl restart netmon")
+    return True
+
+
+def show_config():
+    """Tüm yapılandırmayı göster"""
+    config = get_current_config()
+    
+    print("\n═══════════════════════════════════════════════════")
+    print("  YAPILANDIRMA")
+    print("═══════════════════════════════════════════════════\n")
+    
+    # Interface'ler
+    interfaces = config.get('interfaces', [])
+    if interfaces:
+        print(f"Interface'ler: {', '.join(interfaces)}")
+    else:
+        detected = get_all_interfaces()
+        print(f"Interface'ler: Otomatik ({', '.join(detected)})")
+    
+    # DB yazma aralığı
+    interval = config.get('db_write_interval', 300)
+    print(f"DB yazma aralığı: {interval} saniye ({interval // 60} dakika)")
+    
+    # Veri saklama süresi
+    retention = config.get('data_retention_days', 90)
+    print(f"Veri saklama süresi: {retention} gün")
+    
+    # Log seviyesi
+    log_level = config.get('log_level', 'INFO')
+    print(f"Log seviyesi: {log_level}")
+    
+    # Config dosyası
+    print(f"\nConfig dosyası: {CONFIG_FILE}")
+    if CONFIG_FILE.exists():
+        print("  (mevcut)")
+    else:
+        print("  (varsayılanlar kullanılıyor)")
+    
+    print()
+
+def install_service():
+    """Systemd servisi olarak kur"""
+    service_content = f"""[Unit]
+Description=netmon - Network Traffic Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={os.path.realpath(__file__)} daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+    
+    service_path = Path("/etc/systemd/system/netmon.service")
+    service_path.write_text(service_content)
+    
+    subprocess.run(['systemctl', 'daemon-reload'])
+    subprocess.run(['systemctl', 'enable', 'netmon'])
+    subprocess.run(['systemctl', 'start', 'netmon'])
+    
+    print("✓ netmon servisi kuruldu ve başlatıldı")
+    print("  Durum: systemctl status netmon")
+    print("  Loglar: journalctl -u netmon -f")
+
+def main():
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(0)
+    
+    cmd = sys.argv[1].lower()
+    
+    # Veritabanını başlat
+    init_db()
+    
+    if cmd == 'start':
+        if os.geteuid() != 0:
+            print("Root yetkisi gerekli: sudo netmon start")
+            sys.exit(1)
+        if os.fork() > 0:
+            sys.exit(0)
+        os.setsid()
+        if os.fork() > 0:
+            sys.exit(0)
+        daemon_loop()
+    
+    elif cmd == 'daemon':
+        daemon_loop()
+    
+    elif cmd == 'stop':
+        if PID_FILE.exists():
+            pid = int(PID_FILE.read_text().strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+                print("✓ netmon durduruldu")
+            except OSError:
+                print("Process bulunamadı")
+            PID_FILE.unlink(missing_ok=True)
+        else:
+            print("netmon zaten çalışmıyor")
+    
+    elif cmd == 'status':
+        show_status()
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT MAX(timestamp) FROM traffic')
+        last = c.fetchone()[0]
+        conn.close()
+        if last:
+            print(f"Son veri: {last}")
+        
+        # Interface bilgisi
+        interfaces = get_all_interfaces()
+        print(f"Interface'ler: {', '.join(interfaces)}")
+        
+        # Config bilgisi
+        cfg = get_current_config()
+        print(f"DB yazma aralığı: {cfg.get('db_write_interval', 300) // 60} dakika")
+        
+        config = get_webhook_config()
+        if config and config['url']:
+            status = "Aktif" if config['enabled'] else "Devre dışı"
+            print(f"Webhook: {status}")
+    
+    elif cmd == 'today':
+        get_report(days=1, title="BUGÜNKÜ KULLANIM")
+    
+    elif cmd == 'week':
+        get_report(days=7, title="SON 7 GÜNLÜK KULLANIM")
+    
+    elif cmd == 'month':
+        get_report(days=30, title="SON 30 GÜNLÜK KULLANIM")
+    
+    elif cmd == 'top':
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        get_report(days=30, title=f"EN ÇOK KULLANAN {n} UYGULAMA")
+    
+    elif cmd == 'exclude':
+        if len(sys.argv) < 3:
+            print("Kullanım: netmon exclude <add|remove|list>")
+            sys.exit(1)
+        
+        subcmd = sys.argv[2].lower()
+        
+        if subcmd == 'add' and len(sys.argv) >= 4:
+            ip = sys.argv[3]
+            desc = ' '.join(sys.argv[4:]) if len(sys.argv) > 4 else ""
+            add_excluded_ip(ip, desc)
+        elif subcmd == 'remove' and len(sys.argv) >= 4:
+            remove_excluded_ip(sys.argv[3])
+        elif subcmd == 'list':
+            list_excluded_ips()
+        else:
+            print("Kullanım: netmon exclude <add|remove|list> [IP] [açıklama]")
+    
+    elif cmd == 'webhook':
+        if len(sys.argv) < 3:
+            show_webhook_status()
+            sys.exit(0)
+        
+        subcmd = sys.argv[2].lower()
+        
+        if subcmd == 'set' and len(sys.argv) >= 4:
+            url = sys.argv[3]
+            interval = int(sys.argv[4]) if len(sys.argv) > 4 else 60
+            set_webhook(url, interval)
+        
+        elif subcmd == 'remove':
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('DELETE FROM webhook_config WHERE id = 1')
+            conn.commit()
+            conn.close()
+            print("✓ Webhook kaldırıldı")
+        
+        elif subcmd == 'enable':
+            enable_webhook()
+        
+        elif subcmd == 'disable':
+            disable_webhook()
+        
+        elif subcmd == 'status':
+            show_webhook_status()
+        
+        elif subcmd == 'test':
+            print("Webhook test gönderimi yapılıyor...")
+            send_webhook(test=True)
+        
+        elif subcmd == 'payload':
+            show_webhook_payload()
+        
+        else:
+            print("Kullanım: netmon webhook <set|remove|enable|disable|status|test|payload>")
+    
+    elif cmd == 'install':
+        if os.geteuid() != 0:
+            print("Root yetkisi gerekli: sudo netmon install")
+            sys.exit(1)
+        install_service()
+    
+    elif cmd == 'interfaces':
+        show_interfaces()
+    
+    elif cmd == 'interval':
+        if len(sys.argv) < 3:
+            show_interval()
+        else:
+            subcmd = sys.argv[2].lower()
+            if subcmd == 'set' and len(sys.argv) >= 4:
+                try:
+                    minutes = int(sys.argv[3])
+                    if os.geteuid() != 0:
+                        print("Root yetkisi gerekli: sudo netmon interval set <dakika>")
+                        sys.exit(1)
+                    set_interval(minutes)
+                except ValueError:
+                    print("✗ Geçersiz değer. Dakika olarak sayı girin.")
+            else:
+                print("Kullanım: netmon interval [set <dakika>]")
+    
+    elif cmd == 'config':
+        if len(sys.argv) < 3:
+            show_config()
+        else:
+            subcmd = sys.argv[2].lower()
+            if subcmd == 'show':
+                show_config()
+            else:
+                print("Kullanım: netmon config show")
+    
+    elif cmd == 'test':
+        print("Test modu - 60 saniye veri toplanıyor...")
+        traffic = collect_traffic(duration=60)
+        print(f"\nToplanan veri ({len(traffic)} uygulama):")
+        for app, data in sorted(traffic.items(), key=lambda x: x[1]['sent']+x[1]['recv'], reverse=True):
+            total = data['sent'] + data['recv']
+            if total > 0:
+                print(f"  {app}: {format_bytes(total)}")
+    
+    elif cmd == 'unknown':
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+        show_unknown_traffic(days=days)
+    
+    elif cmd == 'cleanup':
+        print("Veritabanındaki geçersiz uygulama adları düzeltiliyor...")
+        fix_invalid_app_names()
+    
+    else:
+        print(f"Bilinmeyen komut: {cmd}")
+        print_help()
+
+if __name__ == '__main__':
+    main()
