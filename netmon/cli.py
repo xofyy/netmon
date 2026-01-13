@@ -470,20 +470,17 @@ def install():
     import subprocess
     from pathlib import Path
     
-    # Get script path
-    script_path = Path(sys.executable).parent / "netmon"
-    if not script_path.exists():
-        script_path = Path("/usr/local/bin/netmon")
-    
-    service_content = f"""[Unit]
-Description=netmon - Network Traffic Monitor
+    service_content = """[Unit]
+Description=netmon - Application-based Network Traffic Monitor
 After=network.target
 
 [Service]
 Type=simple
-ExecStart={script_path} start
+ExecStart=/usr/local/bin/netmon start
 Restart=always
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

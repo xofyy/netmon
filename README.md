@@ -22,7 +22,7 @@ Uygulama bazlı network trafik izleyici. PLC ve diğer cihazları hariç tutarak
 
 ```bash
 # Depoyu klonla
-git clone https://github.com/user/netmon.git
+git clone https://github.com/xofyy/netmon.git
 cd netmon
 
 # Kurulum scriptini çalıştır
