@@ -1,0 +1,75 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+*.egg
+*.egg-info/
+.eggs/
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS files
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+
+# Testing / Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Project specific - runtime files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+
+# Local configuration (user-specific overrides)
+config.local.yaml
+config.yaml
+!config.default.yaml
+
+# Backup files
+*.bak
+*.backup
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
