@@ -143,8 +143,8 @@ class NethogsCollector:
                         logger.warning("nethogs process terminated")
                         break
                     continue
-                
-                app, ip, sent, recv = parse_nethogs_line(line)
+
+                app, ip, sent, recv = parse_nethogs_line(line, self.config.nethogs_refresh_sec)
                 
                 if app:
                     # Check excluded IPs
@@ -225,8 +225,8 @@ class NethogsCollector:
                 line = proc.stdout.readline()
                 if not line:
                     break
-                
-                app, ip, sent, recv = parse_nethogs_line(line)
+
+                app, ip, sent, recv = parse_nethogs_line(line, self.config.nethogs_refresh_sec)
                 if app:
                     if ip and ip in excluded:
                         continue

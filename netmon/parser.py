@@ -7,36 +7,47 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-def parse_nethogs_line(line: str) -> Tuple[Optional[str], Optional[str], float, float]:
+def parse_nethogs_line(line: str, refresh_sec: int = 1) -> Tuple[Optional[str], Optional[str], float, float]:
     """Parse a single line of nethogs trace output.
-    
+
+    IMPORTANT: nethogs -t mode outputs KB/s (rate), not total bytes!
+    We multiply by refresh_sec to get actual bytes transferred in that period.
+
     Example formats:
     - /usr/bin/firefox/12345/192.168.1.5:443-10.0.0.1:54321	1.234	5.678
     - /usr/bin/python3/1234	0.5	1.2
     - firefox/12345	0.5	1.2
     - unknown TCP/0/0	0	0
-    
+
     Args:
         line: Raw nethogs output line
-        
+        refresh_sec: nethogs refresh interval in seconds (from -d parameter)
+
     Returns:
         Tuple of (app_name, remote_ip, bytes_sent, bytes_recv)
         Returns (None, None, 0, 0) for invalid/skipped lines
     """
+    # Validate refresh_sec
+    if refresh_sec <= 0:
+        logger.warning(f"Invalid refresh_sec={refresh_sec}, using 1")
+        refresh_sec = 1
+
     line = line.strip()
-    
+
     # Skip empty lines and refresh messages
     if not line or line.startswith('Refreshing'):
         return None, None, 0, 0
-    
+
     parts = line.split('\t')
     if len(parts) < 3:
         return None, None, 0, 0
-    
+
     try:
         prog_info = parts[0]
-        sent = float(parts[1]) * 1024  # KB -> Bytes
-        recv = float(parts[2]) * 1024
+        # nethogs -t outputs KB/s (rate), multiply by refresh interval to get total bytes
+        # Formula: KB/s × seconds × 1024 = Bytes
+        sent = float(parts[1]) * refresh_sec * 1024
+        recv = float(parts[2]) * refresh_sec * 1024
         
         # Extract app name and remote IP
         app_name = extract_app_name(prog_info)
@@ -48,7 +59,7 @@ def parse_nethogs_line(line: str) -> Tuple[Optional[str], Optional[str], float, 
         return app_name, remote_ip, sent, recv
         
     except (ValueError, IndexError) as e:
-        logger.debug(f"Parse error: {line} - {e}")
+        logger.warning(f"nethogs parse error: {line[:100]} - {e}")
         return None, None, 0, 0
 
 

@@ -360,15 +360,18 @@ def run_live_monitor(collector, interfaces: list[str]) -> None:
                     line = collector._process.stdout.readline()
                     if not line:
                         break
-                    
-                    app, ip, sent, recv = parse_nethogs_line(line)
-                    
+
+                    # Parse with refresh_sec to get bytes transferred during interval
+                    app, ip, sent, recv = parse_nethogs_line(line, collector.config.nethogs_refresh_sec)
+
                     if app:
                         if app not in traffic:
                             traffic[app] = {'sent': 0, 'recv': 0, 'rate_sent': 0, 'rate_recv': 0}
-                        
-                        traffic[app]['rate_sent'] = sent
-                        traffic[app]['rate_recv'] = recv
+
+                        # Display rate (bytes/second) - divide by refresh interval
+                        traffic[app]['rate_sent'] = sent / collector.config.nethogs_refresh_sec
+                        traffic[app]['rate_recv'] = recv / collector.config.nethogs_refresh_sec
+                        # Accumulate total bytes transferred
                         traffic[app]['sent'] += sent
                         traffic[app]['recv'] += recv
                     

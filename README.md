@@ -20,12 +20,14 @@ Uygulama bazlı network trafik izleyici. PLC ve diğer cihazları hariç tutarak
 
 ## Kurulum
 
+### Hızlı Kurulum
+
 ```bash
 # Depoyu klonla
 git clone https://github.com/xofyy/netmon.git
 cd netmon
 
-# Kurulum scriptini çalıştır
+# Kurulum scriptini çalıştır (sessiz mod)
 sudo ./scripts/install.sh
 ```
 
@@ -38,20 +40,49 @@ sudo ./scripts/install.sh
 # Etkileşimli kurulum (sorular sorar)
 sudo ./scripts/install.sh -i
 
-# Güncelleme (veriyi korur)
-sudo ./scripts/install.sh upgrade
-
-# Kaldırma
-sudo ./scripts/install.sh uninstall
-
-# Kaldırma (veriyi koru)
-sudo ./scripts/install.sh uninstall --keep-data
-
 # Kurulum durumu
 ./scripts/install.sh status
 
 # Yardım
 ./scripts/install.sh --help
+```
+
+### Güncelleme
+
+**🚀 Tek Komutla Hızlı Güncelleme (Önerilen):**
+
+```bash
+# Mevcut kurulumu güncelle
+cd netmon
+sudo ./update.sh
+```
+
+**Manuel Güncelleme:**
+
+```bash
+# Git ile en son kodu çek ve güncelle
+cd netmon
+git pull
+sudo ./scripts/install.sh upgrade
+```
+
+**Uzaktan Güncelleme (SSH):**
+
+```bash
+# GitHub'dan direkt çalıştır
+curl -sSL https://raw.githubusercontent.com/xofyy/netmon/main/update.sh | sudo bash
+```
+
+> **Not:** `upgrade` komutu mevcut yapılandırma ve veritabanını korur.
+
+### Kaldırma
+
+```bash
+# Tamamen kaldır
+sudo ./scripts/install.sh uninstall
+
+# Veri ve yapılandırmayı koruyarak kaldır
+sudo ./scripts/install.sh uninstall --keep-data
 ```
 
 ### Manuel Kurulum

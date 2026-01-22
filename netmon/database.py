@@ -129,17 +129,26 @@ def save_traffic(traffic_data: dict[str, dict], config: Optional[NetmonConfig] =
     for app, data in traffic_data.items():
         if data['sent'] > 0 or data['recv'] > 0:
             ips = list(data.get('ips', set()))
-            
+
             if ips:
-                # Split traffic across IPs
-                per_ip_sent = int(data['sent'] / len(ips))
-                per_ip_recv = int(data['recv'] / len(ips))
-                
-                for ip in ips:
+                # Split traffic across IPs, preserving all bytes
+                num_ips = len(ips)
+                base_sent = int(data['sent'] // num_ips)
+                base_recv = int(data['recv'] // num_ips)
+
+                # Calculate remainder to distribute to first N IPs
+                remainder_sent = int(data['sent']) - (base_sent * num_ips)
+                remainder_recv = int(data['recv']) - (base_recv * num_ips)
+
+                for i, ip in enumerate(ips):
+                    # Distribute remainder to first N IPs (where N = remainder)
+                    ip_sent = base_sent + (1 if i < remainder_sent else 0)
+                    ip_recv = base_recv + (1 if i < remainder_recv else 0)
+
                     c.execute('''
                         INSERT INTO traffic (app_name, remote_ip, bytes_sent, bytes_recv)
                         VALUES (?, ?, ?, ?)
-                    ''', (app, ip, per_ip_sent, per_ip_recv))
+                    ''', (app, ip, ip_sent, ip_recv))
             else:
                 c.execute('''
                     INSERT INTO traffic (app_name, remote_ip, bytes_sent, bytes_recv)
