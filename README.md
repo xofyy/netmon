@@ -269,6 +269,40 @@ pip install -e .
 sudo netmon test 60
 ```
 
+## ⚠️ Veri Doğruluğu Notu
+
+**Önemli:** **23 Ocak 2026 öncesi** toplanan trafik verileri, nethogs hesaplama hatasından dolayı yaklaşık **%80 eksik** kaydedilmiştir. Bu durum v2.1.0 öncesi sürümlerin bilinen bir kısıtlamasıdır.
+
+### Düzeltme Detayları
+
+**v2.1.0'da Düzeltilen Sorunlar:**
+- nethogs rate × süre çarpımı eksikliği (%80 veri kaybı) ✅ DÜZELTİLDİ
+- IP bölünmesinde ondalık kayıplar ✅ DÜZELTİLDİ
+- Parse hatalarının görünürlüğü ✅ İYİLEŞTİRİLDİ
+
+**Etki:**
+- v2.0.0 ve öncesi: ~%20 doğruluk
+- v2.1.0 ve sonrası: ~%82+ doğruluk
+
+### Kurulum Tarihinizi Kontrol Edin
+
+```bash
+# İlk veri tarihi
+sqlite3 /var/lib/netmon/traffic.db \
+  "SELECT MIN(timestamp) as ilk_kayit FROM traffic"
+
+# Güncelleme öncesi vs sonrası karşılaştırma
+sqlite3 /var/lib/netmon/traffic.db \
+  "SELECT
+     DATE(timestamp) as tarih,
+     ROUND(SUM(bytes_sent + bytes_recv)/1024.0/1024.0, 2) as toplam_mb
+   FROM traffic
+   WHERE timestamp > DATE('now', '-7 days')
+   GROUP BY DATE(timestamp)"
+```
+
+**Not:** Geçmiş veriler gerçek değerleriyle değiştirilemez. 23 Ocak 2026 öncesi veriler için yaklaşık tahmin elde etmek isterseniz değerleri **×5 ile çarpabilirsiniz** (yalnızca tahmin içindir).
+
 ## Lisans
 
 MIT
