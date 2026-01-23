@@ -8,7 +8,7 @@ set -euo pipefail
 # GLOBAL VARIABLES
 # ============================================================================
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 SCRIPT_DIR=""
 LOG_FILE="/tmp/netmon_install_$(date +%Y%m%d_%H%M%S).log"
 TOTAL_STEPS=6

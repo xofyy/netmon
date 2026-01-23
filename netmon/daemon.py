@@ -13,8 +13,12 @@ from typing import Optional
 from netmon.collector import NethogsCollector
 from netmon.config import NetmonConfig, load_config, setup_logging
 from netmon.database import init_db
+from netmon.utils import get_all_interfaces
 
 logger = logging.getLogger(__name__)
+
+# Interface refresh interval (5 minutes)
+INTERFACE_REFRESH_INTERVAL = 300
 
 
 class GracefulKiller:
@@ -225,6 +229,9 @@ def run_daemon(config: Optional[NetmonConfig] = None) -> None:
     
     logger.info("All worker threads started")
     
+    # Track last interface refresh time
+    last_interface_refresh = time.time()
+    
     # Main loop
     while not killer.kill_now and not collector.shutdown_event.is_set():
         try:
@@ -254,6 +261,19 @@ def run_daemon(config: Optional[NetmonConfig] = None) -> None:
                     name='webhook-worker'
                 )
                 webhook_thread.start()
+            
+            # Periodic interface refresh
+            if time.time() - last_interface_refresh > INTERFACE_REFRESH_INTERVAL:
+                new_interfaces = config.interfaces or get_all_interfaces()
+                if set(new_interfaces) != set(collector.interfaces):
+                    logger.info(f"Interface change detected: {collector.interfaces} -> {new_interfaces}")
+                    # Restart collector with new interfaces
+                    collector.stop()
+                    collector.interfaces = new_interfaces
+                    collector.start()
+                    collector.start_reader_thread()
+                    logger.info("Collector restarted with updated interfaces")
+                last_interface_refresh = time.time()
             
             # Sleep
             collector.shutdown_event.wait(timeout=config.main_loop_check_sec)

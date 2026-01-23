@@ -113,11 +113,17 @@ def print_status(
     else:
         status_text = "[red]✗ Çalışmıyor[/red]"
     
+    # Format DB interval (show seconds if < 60, otherwise minutes)
+    if db_interval >= 60:
+        interval_str = f"{db_interval // 60} dakika"
+    else:
+        interval_str = f"{db_interval} saniye"
+    
     lines = [
         f"Durum: {status_text}",
         f"Son veri: {last_data or 'Henüz yok'}",
         f"Interface'ler: {', '.join(interfaces)}",
-        f"DB yazma aralığı: {db_interval // 60} dakika",
+        f"DB yazma aralığı: {interval_str}",
     ]
     
     if webhook_status:

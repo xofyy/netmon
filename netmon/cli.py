@@ -161,9 +161,18 @@ def live_monitor():
     init_db()
     
     from netmon.collector import NethogsCollector
-    from netmon.display import run_live_monitor
+    from netmon.daemon import DaemonManager
+    from netmon.display import run_live_monitor, print_warning
     
     config = load_config()
+    
+    # Check if daemon is running
+    dm = DaemonManager(config.pid_path)
+    if not dm.is_running():
+        print_warning("Daemon çalışmıyor! Veriler kaydedilmeyecek.")
+        print_info("Kayıt için: sudo systemctl start netmon")
+        console.print()
+    
     collector = NethogsCollector(config)
     
     try:
